@@ -46,7 +46,7 @@ show_help() {
 Script de Deploy ECS - Projeto BIA
 
 USAGE:
-    ./deploy-ecs-fixed.sh [COMMAND] [OPTIONS]
+    ./deploy-ecs.sh [COMMAND] [OPTIONS]
 
 COMMANDS:
     deploy          Faz build da imagem e deploy para ECS
@@ -65,16 +65,27 @@ OPTIONS:
 
 EXAMPLES:
     # Deploy normal (usa commit hash atual)
-    ./deploy-ecs-fixed.sh deploy
+    ./deploy-ecs.sh deploy
 
     # Deploy com configurações customizadas
-    ./deploy-ecs-fixed.sh deploy -r us-west-2 -e meu-repo
+    ./deploy-ecs.sh deploy -r us-west-2 -e meu-repo
 
     # Rollback para uma versão específica
-    ./deploy-ecs-fixed.sh rollback -t abc1234
+    ./deploy-ecs.sh rollback -t abc1234
 
     # Listar versões disponíveis
-    ./deploy-ecs-fixed.sh list-versions
+    ./deploy-ecs.sh list-versions
+
+WORKFLOW:
+    1. O script pega o hash do commit atual (últimos 7 caracteres)
+    2. Faz build da imagem Docker com tag: latest e commit-hash
+    3. Faz push para ECR
+    4. Cria nova task definition apontando para a imagem com commit-hash
+    5. Atualiza o serviço ECS com a nova task definition
+
+ROLLBACK:
+    Para fazer rollback, use o comando 'rollback' com a tag desejada.
+    Use 'list-versions' para ver as versões disponíveis.
 
 EOF
 }
@@ -145,7 +156,7 @@ create_task_definition() {
     log_info "Criando nova task definition..."
     
     # Obter a task definition atual
-    local current_task_def=$(aws ecs describe-task-definition --task-definition $task_family --region $region --query 'taskDefinition' --output json 2>/dev/null)
+    local current_task_def=$(aws ecs describe-task-definition --task-definition $task_family --region $region --query 'taskDefinition' --output json)
     
     if [ $? -ne 0 ]; then
         log_error "Não foi possível obter a task definition atual: $task_family"
@@ -154,56 +165,31 @@ create_task_definition() {
     
     # Extrair informações necessárias da task definition atual
     local execution_role=$(echo "$current_task_def" | jq -r '.executionRoleArn // empty')
-    local task_role=$(echo "$current_task_def" | jq -r '.taskRoleArn // empty')
     local network_mode=$(echo "$current_task_def" | jq -r '.networkMode // "bridge"')
     local volumes=$(echo "$current_task_def" | jq -c '.volumes // []')
-    local cpu=$(echo "$current_task_def" | jq -r '.cpu // empty')
-    local memory=$(echo "$current_task_def" | jq -r '.memory // empty')
-    local requires_compatibilities=$(echo "$current_task_def" | jq -c '.requiresCompatibilities // []')
     
     # Atualizar apenas a imagem no container definition
     local container_defs=$(echo "$current_task_def" | jq --arg image "$ecr_uri:$tag" '.containerDefinitions[0].image = $image | .containerDefinitions')
     
     log_info "Registrando nova task definition com imagem: $ecr_uri:$tag"
     
-    # Criar arquivo temporário para container definitions
-    local temp_file=$(mktemp)
-    echo "$container_defs" > "$temp_file"
-    
     # Construir comando AWS CLI
-    local aws_cmd="aws ecs register-task-definition --region $region --family $task_family --container-definitions file://$temp_file"
+    local aws_cmd="aws ecs register-task-definition --region $region --family $task_family"
     
     # Adicionar execution role se existir
-    if [ ! -z "$execution_role" ] && [ "$execution_role" != "null" ] && [ "$execution_role" != "" ]; then
+    if [ ! -z "$execution_role" ] && [ "$execution_role" != "null" ]; then
         aws_cmd="$aws_cmd --execution-role-arn $execution_role"
     fi
     
-    # Adicionar task role se existir
-    if [ ! -z "$task_role" ] && [ "$task_role" != "null" ] && [ "$task_role" != "" ]; then
-        aws_cmd="$aws_cmd --task-role-arn $task_role"
-    fi
-    
     # Adicionar network mode se existir
-    if [ ! -z "$network_mode" ] && [ "$network_mode" != "null" ] && [ "$network_mode" != "" ]; then
+    if [ ! -z "$network_mode" ] && [ "$network_mode" != "null" ]; then
         aws_cmd="$aws_cmd --network-mode $network_mode"
     fi
     
-    # Adicionar CPU se existir
-    if [ ! -z "$cpu" ] && [ "$cpu" != "null" ] && [ "$cpu" != "" ]; then
-        aws_cmd="$aws_cmd --cpu $cpu"
-    fi
-    
-    # Adicionar memory se existir
-    if [ ! -z "$memory" ] && [ "$memory" != "null" ] && [ "$memory" != "" ]; then
-        aws_cmd="$aws_cmd --memory $memory"
-    fi
-    
-    # Adicionar requires compatibilities se existir
-    if [ "$requires_compatibilities" != "[]" ] && [ "$requires_compatibilities" != "null" ]; then
-        local compat_file=$(mktemp)
-        echo "$requires_compatibilities" > "$compat_file"
-        aws_cmd="$aws_cmd --requires-compatibilities file://$compat_file"
-    fi
+    # Salvar container definitions em arquivo temporário
+    local temp_file=$(mktemp)
+    echo "$container_defs" > "$temp_file"
+    aws_cmd="$aws_cmd --container-definitions file://$temp_file"
     
     # Adicionar volumes se existirem
     if [ "$volumes" != "[]" ] && [ "$volumes" != "null" ]; then
@@ -214,16 +200,12 @@ create_task_definition() {
     
     aws_cmd="$aws_cmd --output json"
     
-    # Executar comando e capturar saída
-    local register_response
-    register_response=$(eval $aws_cmd 2>&1)
+    # Executar comando
+    local register_response=$(eval $aws_cmd 2>&1)
     local register_exit_code=$?
     
     # Limpar arquivos temporários
     rm -f "$temp_file"
-    if [ ! -z "$compat_file" ]; then
-        rm -f "$compat_file"
-    fi
     if [ ! -z "$volumes_file" ]; then
         rm -f "$volumes_file"
     fi
@@ -245,7 +227,7 @@ create_task_definition() {
     fi
     
     log_success "Nova task definition criada: $task_family:$new_revision"
-    echo "$new_revision"
+    echo $new_revision
 }
 
 # Função para atualizar o serviço ECS
@@ -259,17 +241,14 @@ update_service() {
     log_info "Atualizando serviço ECS..."
     log_info "Task Definition: $task_family:$revision"
     
-    local update_response
-    update_response=$(aws ecs update-service \
+    aws ecs update-service \
         --region $region \
         --cluster $cluster \
         --service $service \
-        --task-definition $task_family:$revision \
-        --output json 2>&1)
+        --task-definition $task_family:$revision > /dev/null
     
     if [ $? -ne 0 ]; then
         log_error "Falha ao atualizar o serviço ECS"
-        log_error "Resposta: $update_response"
         exit 1
     fi
     
@@ -278,11 +257,7 @@ update_service() {
     
     aws ecs wait services-stable --region $region --cluster $cluster --services $service
     
-    if [ $? -eq 0 ]; then
-        log_success "Deploy concluído com sucesso!"
-    else
-        log_warning "Timeout aguardando estabilização do serviço. Verifique o status manualmente."
-    fi
+    log_success "Deploy concluído com sucesso!"
 }
 
 # Função para listar versões disponíveis
@@ -330,8 +305,7 @@ deploy() {
     
     # Criar nova task definition
     log_info "Criando nova task definition..."
-    local new_revision
-    new_revision=$(create_task_definition $region $task_family $ecr_uri $commit_hash)
+    local new_revision=$(create_task_definition $region $task_family $ecr_uri $commit_hash)
     
     if [ -z "$new_revision" ] || [ "$new_revision" = "null" ]; then
         log_error "Falha ao obter revision da nova task definition"
@@ -375,8 +349,7 @@ rollback() {
     fi
     
     # Criar nova task definition com a imagem de rollback
-    local new_revision
-    new_revision=$(create_task_definition $region $task_family $ecr_uri $target_tag)
+    local new_revision=$(create_task_definition $region $task_family $ecr_uri $target_tag)
     
     # Atualizar serviço
     update_service $region $cluster $service $task_family $new_revision
